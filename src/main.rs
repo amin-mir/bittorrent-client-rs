@@ -8,7 +8,7 @@ use bencode::{Decoder, DownloadType, Torrent};
 mod download;
 
 mod tracker;
-use tracker::{DiscoverRequest, Tracker};
+use tracker::Tracker;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -52,10 +52,11 @@ async fn main() -> Result<()> {
             };
             println!("output = {output}, expected length: {length}");
 
+            let t = Tracker::new(torrent.announce);
+
             let info_hash = torrent.info.hash();
             let self_id = gen_peer_id();
-            let req = DiscoverRequest::new(&info_hash, &self_id, length);
-            let t = Tracker::new(torrent.announce);
+            let req = tracker::DiscoverRequest::new(&info_hash, &self_id, length);
             let peers = t.discover(req).await?;
 
             let mut file = download::File {
