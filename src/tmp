@@ -1,0 +1,254 @@
+
+use std::net::SocketAddr;
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+
+mod bencode;
+use bencode::meta_info::{DownloadType, MetaInfo};
+use bencode::Decoder;
+
+mod download;
+use download::{Handshake, HandshakeCodec, Message, MessageCodec};
+
+mod tracker;
+
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+use tokio::net::TcpStream;
+use tokio::time::{self, Duration};
+use tokio_util::codec::Framed;
+use tracker::{DiscoverRequest, Tracker};
+
+#[derive(Debug, Parser)]
+struct Args {
+    #[arg(long, default_value_t = Decoder::Nom)]
+    decoder: Decoder,
+    #[command(subcommand)]
+    commands: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    Decode {
+        value: String,
+    },
+    Info {
+        torrent_file: String,
+    },
+    Peers {
+        torrent_file: String,
+    },
+    Handshake {
+        torrent_file: String,
+        peer_addr: SocketAddr,
+    },
+    #[command(name = "download_piece")]
+    DownloadPiece {
+        #[arg(short, long)]
+        output: String,
+        torrent_file: String,
+        piece_index: u32,
+    },
+}
+
+// Usage:
+// your_bittorrent.sh decode "<encoded_value>"
+// your_bittorrent.sh info "<torrent.file>"
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let decoder = &args.decoder;
+
+    match args.commands {
+        Commands::Decode { value } => {
+            let (remaining, decoded_value) = decoder.decode(value.as_bytes())?;
+            debug_assert!(remaining.is_empty());
+            println!("{:?}", decoded_value);
+            Ok(())
+        }
+        Commands::Info { torrent_file } => {
+            let meta = parse_meta_info(torrent_file)?;
+            let DownloadType::SingleFile { length } = meta.info.download_type else {
+                bail!("expected single file torrent");
+            };
+
+            println!("Tracker URL: {:?}", meta.announce);
+            println!("Length: {:?}", length);
+            println!("{:?}", meta.info.hash());
+            println!("Info Hash: {}", hex::encode(meta.info.hash()));
+            println!("Piece Length: {}", meta.info.piece_length);
+            println!("Pieces Hashes:");
+            for h in meta.info.pieces.0 {
+                println!("{}", hex::encode(h))
+            }
+
+            Ok(())
+        }
+        Commands::Peers { torrent_file } => {
+            let meta = parse_meta_info(torrent_file)?;
+            let DownloadType::SingleFile { length } = meta.info.download_type else {
+                bail!("expected single file torrent");
+            };
+
+            let self_id = tracker::gen_peer_id();
+            let t = Tracker::new(meta.announce);
+
+            let info_hash = meta.info.hash();
+            let req = DiscoverRequest::new(&info_hash, &self_id, length.try_into().unwrap());
+            let peers = t.discover(req).await?;
+
+            for p in peers.iter() {
+                println!("{}:{}", p.ip, p.port);
+            }
+            Ok(())
+        }
+        Commands::Handshake {
+            torrent_file,
+            peer_addr,
+        } => {
+            let meta = parse_meta_info(torrent_file)?;
+
+            let self_id = tracker::gen_peer_id().as_bytes().try_into()?;
+
+            let stream = TcpStream::connect(peer_addr).await?;
+            let mut handshakes = Framed::new(stream, HandshakeCodec);
+            let handshake = Handshake::new(meta.info.hash(), self_id);
+
+            handshakes.send(handshake).await?;
+            let peer_handshake = handshakes
+                .next()
+                .await
+                .expect("peer did not send handshake")?;
+            println!("Peer ID: {}", hex::encode(peer_handshake.peer_id));
+            Ok(())
+        }
+        Commands::DownloadPiece {
+            output,
+            torrent_file,
+            piece_index,
+        } => {
+            println!("output = {output}, piece index = {piece_index}");
+            let meta = parse_meta_info(torrent_file)?;
+            let DownloadType::SingleFile { length } = meta.info.download_type else {
+                bail!("expected single file torrent");
+            };
+
+            let info_hash = meta.info.hash();
+            let self_id = tracker::gen_peer_id();
+
+            let req = DiscoverRequest::new(&info_hash, &self_id, length.try_into().unwrap());
+            let t = Tracker::new(meta.announce);
+            let peers = t.discover(req).await?;
+
+            let stream = TcpStream::connect((peers[0].ip, peers[0].port)).await?;
+            let mut handshakes = Framed::new(stream, HandshakeCodec);
+            let handshake = Handshake::new(meta.info.hash(), self_id.as_bytes().try_into()?);
+
+            handshakes.send(handshake).await?;
+            let peer_handshake = handshakes.next().await.expect("receive peer handshake")?;
+            println!("Peer ID: {}", hex::encode(peer_handshake.peer_id));
+
+            let mut message_stream = handshakes.map_codec(|_c| MessageCodec);
+
+            let bitfield = message_stream.next().await.expect("receive bitfield")?;
+
+            let Message::BitField(bitfield) = bitfield else {
+                bail!("expected bitfield, received {:?}", bitfield);
+            };
+            bitfield.iter().for_each(|b| println!("bitfield: {:b}", b));
+
+            message_stream.send(Message::Interested).await?;
+            println!("interested sent");
+
+            let unchoke = message_stream
+                .next()
+                .await
+                .expect("did not receive unchoke")?;
+
+            let Message::Unchoke = unchoke else {
+                bail!("expected unchoke");
+            };
+
+            let current_piece_size =
+                get_piece_size(length as u32, meta.info.piece_length as u32, piece_index);
+            println!("current piece size: {current_piece_size}");
+            let piece = download_piece(
+                current_piece_size,
+                meta.info.piece_length as u32,
+                &mut message_stream,
+            )
+            .await?;
+            println!("downloaded piece with len={}", piece.len());
+
+            Ok(())
+        }
+    }
+}
+
+fn parse_meta_info(torrent_file: String) -> Result<MetaInfo> {
+    let meta_bytes = std::fs::read(torrent_file).context("expecting a valid torrent file path")?;
+    serde_bencode::from_bytes(&meta_bytes).map_err(|e| e.into())
+}
+
+fn get_piece_size(file_size: u32, piece_size: u32, piece_index: u32) -> u32 {
+    let begin = piece_index * piece_size;
+    if begin + piece_size > file_size {
+        return file_size - begin;
+    }
+    piece_size
+}
+
+const BLOCK_SIZE: u32 = 1 << 14;
+
+// TODO: read mini-redis frame & connection code and get read of codec
+// in favor of doing things in a more performant.
+async fn download_piece(
+    piece_size: u32,
+    piece_index: u32,
+    stream: &mut Framed<TcpStream, MessageCodec>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut piece_bytes = Vec::with_capacity(piece_size as usize);
+    let mut downloaded = 0;
+    // let (mut sink, stream) = stream.split();
+    while downloaded < piece_size {
+        let mut next_block_len = piece_size - downloaded;
+        if next_block_len > BLOCK_SIZE {
+            next_block_len = BLOCK_SIZE;
+        }
+        let req = Message::Request {
+            index: piece_index,
+            begin: downloaded,
+            length: next_block_len,
+        };
+        stream.send(req).await?;
+
+        let piece = loop {
+            tokio::select! {
+                Some(piece) = stream.next() => {
+                    break piece?;
+                }
+                _ = time::sleep(Duration::from_secs(1)) => {
+                    println!("timeout");
+                }
+            }
+        };
+
+        let Message::Piece {
+            index,
+            begin,
+            mut block,
+        } = piece
+        else {
+            bail!("expected piece, received {:?}", piece);
+        };
+
+        anyhow::ensure!(index == piece_index, "piece index should match");
+        anyhow::ensure!(begin == downloaded, "block index should match");
+        piece_bytes.append(&mut block);
+
+        downloaded += next_block_len;
+        println!("downloaded a block");
+    }
+    Ok(piece_bytes)
+}
