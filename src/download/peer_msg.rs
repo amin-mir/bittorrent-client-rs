@@ -14,9 +14,9 @@ pub enum Message {
         piece_index: u32,
     },
 
-    /// BitField is only ever sent as the first message,
+    /// Bitfield is only ever sent as the first message,
     /// right after handshake.
-    BitField(Vec<u8>),
+    Bitfield(Vec<u8>),
     Request {
         index: u32,
         begin: u32,
@@ -42,7 +42,7 @@ enum MessageType {
     Interested,
     NotInterested,
     Have,
-    BitField,
+    Bitfield,
     Request,
     Piece,
     Cancel,
@@ -58,7 +58,7 @@ impl TryFrom<u8> for MessageType {
             2 => Ok(MessageType::Interested),
             3 => Ok(MessageType::NotInterested),
             4 => Ok(MessageType::Have),
-            5 => Ok(MessageType::BitField),
+            5 => Ok(MessageType::Bitfield),
             6 => Ok(MessageType::Request),
             7 => Ok(MessageType::Piece),
             8 => Ok(MessageType::Cancel),
@@ -108,12 +108,12 @@ impl Decoder for MessageCodec {
                 let piece_index = src.get_u32();
                 Message::Have { piece_index }
             }
-            MessageType::BitField => {
+            MessageType::Bitfield => {
                 // msg_len is the total message length including the 1 byte
                 // message type. That's why we allocate msg_len - 1.
                 let mut bitfield = vec![0; msg_len - 1];
                 src.copy_to_slice(&mut bitfield);
-                Message::BitField(bitfield)
+                Message::Bitfield(bitfield)
             }
             MessageType::Request => {
                 let index = src.get_u32();
@@ -186,13 +186,13 @@ impl Encoder<Message> for MessageCodec {
                 dst.put_u8(MessageType::Have as u8);
                 dst.put_u32(piece_index);
             }
-            Message::BitField(bitfield) => {
+            Message::Bitfield(bitfield) => {
                 // len(u32) + type(u8) + bitfield(Vec<u8>)
                 // 4 + 1 + bitfield.len()
                 dst.reserve(bitfield.len() + 5);
 
                 dst.put_u32(bitfield.len() as u32 + 1);
-                dst.put_u8(MessageType::BitField as u8);
+                dst.put_u8(MessageType::Bitfield as u8);
                 dst.put(&bitfield[..]);
             }
             Message::Request {
@@ -277,7 +277,7 @@ mod tests {
         codev_interested: Message::Interested;
         codec_not_interested: Message::NotInterested;
         codec_have: Message::Have { piece_index: 2 };
-        codec_bit_field: Message::BitField(vec![1, 0, 1, 0, 1, 0, 0, 0]);
+        codec_bit_field: Message::Bitfield(vec![1, 0, 1, 0, 1, 0, 0, 0]);
         codec_request: Message::Request { index: 3, begin: 16384, length: 32768 };
         codec_piece: Message::Piece { index: 3, begin: 16384, block: vec![1, 1, 1, 1, 0, 0, 0, 0] };
         codec_cancel: Message::Cancel { index: 3, begin: 16384, length: 100_000 }

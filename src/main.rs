@@ -59,19 +59,13 @@ async fn main() -> Result<()> {
             let req = tracker::DiscoverRequest::new(&info_hash, &self_id, length);
             let peers = t.discover(req).await?;
 
-            let mut file = download::File {
-                id: self_id,
-                torrent_info: torrent.info,
-                peers,
-            };
+            let mut file = download::File::new(self_id, torrent.info, peers);
             let file_bytes = file.download().await?;
 
-            println!("downloaded piece with len={}", file_bytes.len());
+            println!("downloaded file with len={}", file_bytes.len());
 
-            // Write piece to disk.
             tokio::fs::write(output, file_bytes).await?;
 
-            // Implement downloading whole file.
             // Implement FileWriter and Write pieces to a preallocated file.
 
             Ok(())
