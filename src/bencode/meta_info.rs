@@ -24,24 +24,15 @@ pub struct Info {
 
     #[serde(flatten)]
     pub download_type: DownloadType,
-
-    #[serde(skip)]
-    hash: Option<[u8; 20]>,
 }
 
 impl Info {
     /// Calculate the hash of torrent info.
-    pub fn hash(&mut self) -> [u8; 20] {
-        if let Some(hash) = self.hash {
-            return hash;
-        }
-
+    pub fn hash(&self) -> [u8; 20] {
         let info_bytes = serde_bencode::to_bytes(self).expect("re-encoding info must succeed");
         let mut hasher = Sha1::new();
         hasher.update(&info_bytes);
-        let hash = hasher.finalize().into();
-        self.hash.replace(hash);
-        hash
+        hasher.finalize().into()
     }
 
     pub fn get_piece_length(&self, piece_index: u32) -> u32 {

@@ -132,6 +132,38 @@ impl Bitfield {
 //     set_bits
 // }
 
+// TODO: useful when implementing single threaded solution with mio.
+//
+// Each bit in the u8 represents the choke status of the
+// seed with that bit index e.g. given 0b00010101, the
+// seeds 0, 2 and 4 have CHOKED US. Because we're using
+// 8 bits we can have 8 peers at max.
+//
+// struct PeerChoke(u8);
+//
+// impl PeerChoke {
+//     fn new() -> Self {
+//         // Connections start out choked and not interested.
+//         Self(u8::MAX)
+//     }
+//     fn has_choked(&self, idx: usize) -> bool {
+//         if idx > 7 {
+//             panic!("idx must be between 0 and 7.");
+//         }
+//         // TODO: benchmark the following.
+//         // self.0 >> idx & 1 == 1
+//         self.0 & 1 << idx != 0
+//     }
+//
+//     fn choke(&mut self, idx: usize) {
+//         self.0 = self.0 | 1 << idx;
+//     }
+//
+//     fn unchoke(&mut self, idx: usize) {
+//         self.0 = self.0 & !(1 << idx)
+//     }
+// }
+
 fn piece_bucket_offset(piece_idx: u32) -> (usize, u8) {
     let bucket = piece_idx / 8;
     let offset = 7 - piece_idx % 8;

@@ -24,6 +24,9 @@ impl Default for Handshake {
 }
 
 impl Handshake {
+    // TODO: we can use &[u8; 20] to avoid copying hash and id.
+    // hash and id are the same for all handshakes, so we can
+    // reduce copying to only a 8 bytes instead of 20.
     pub fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Handshake {
         Handshake {
             length: 19,
