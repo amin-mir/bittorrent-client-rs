@@ -10,6 +10,11 @@ use sha1::{Digest, Sha1};
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct Torrent {
     pub announce: String,
+
+    #[serde(default)]
+    #[serde(rename = "announce-list")]
+    pub announce_list: Vec<Vec<String>>,
+
     pub info: Info,
 }
 
@@ -71,7 +76,7 @@ impl Deref for Pieces {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(untagged)]
 pub enum DownloadType {
     SingleFile { length: u64 },
@@ -87,7 +92,7 @@ impl DownloadType {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct File {
     pub length: u64,
     pub path: Vec<String>,
@@ -163,10 +168,10 @@ mod tests {
             piece_length: 65536,
             pieces: Pieces(vec![hashed]),
             download_type: DownloadType::SingleFile { length: 20 },
-            hash: None,
         };
         let expected = Torrent {
             announce: "udp://tracker.openbittorrent.com:80".to_string(),
+            announce_list: Vec::new(),
             info,
         };
         assert_eq!(meta, expected);
@@ -194,7 +199,6 @@ mod tests {
                     },
                 ],
             },
-            hash: None,
         };
 
         let b = serde_bencode::to_bytes(&info).unwrap();

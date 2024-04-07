@@ -21,3 +21,6 @@ url = "2.5.0"
 byteorder = "1.5.0"
 futures = "0.3.30"
 kanal = "0.1.0-pre8"
+
+[dev-dependencies]
+tempfile = "3.10.1"

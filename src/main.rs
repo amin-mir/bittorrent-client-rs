@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rand::{distributions::Alphanumeric, Rng};
@@ -8,7 +10,9 @@ use bencode::{Decoder, DownloadType, Torrent};
 mod download;
 
 mod tracker;
-use tracker::Tracker;
+use tracker::UdpTracker;
+
+mod file;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -46,31 +50,77 @@ async fn main() -> Result<()> {
             output,
             torrent_file,
         } => {
-            let mut torrent = parse_meta_info(torrent_file)?;
-            let DownloadType::SingleFile { length } = torrent.info.download_type else {
-                bail!("expected single file torrent");
-            };
-            println!("output = {output}, expected length: {length}");
-
-            let t = Tracker::new(torrent.announce);
+            let torrent = parse_meta_info(torrent_file)?;
+            let dl_type = torrent.info.download_type.clone();
+            println!("{:?}", torrent.announce_list);
+            println!(
+                "output = {output}, expected length: {}",
+                torrent.info.total_length()
+            );
 
             let info_hash = torrent.info.hash();
             let self_id = gen_peer_id();
-            let req = tracker::DiscoverRequest::new(&info_hash, &self_id, length);
-            let peers = t.discover(req).await?;
+            let total_length = torrent.info.total_length();
 
-            let mut file = download::File::new(self_id, torrent.info, peers);
+            let peers = pick_tracker(
+                torrent.announce_list,
+                info_hash,
+                self_id.clone(),
+                total_length,
+            )
+            .await?;
+
+            let file = download::File::new(self_id, torrent.info, peers);
             let file_bytes = file.download().await?;
 
             println!("downloaded file with len={}", file_bytes.len());
 
-            tokio::fs::write(output, file_bytes).await?;
-
-            // Implement FileWriter and Write pieces to a preallocated file.
+            file::write(output, dl_type, file_bytes).await?;
 
             Ok(())
         }
     }
+}
+
+async fn pick_tracker(
+    announce_list: Vec<Vec<String>>,
+    info_hash: [u8; 20],
+    self_id: String,
+    total_length: u64,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    for url in announce_list {
+        let url = url.get(0).unwrap();
+        let mut tracker = match UdpTracker::connect(url.clone()).await {
+            Err(e) => {
+                println!("Error connecting to tracker {}: {}", url, e);
+                continue;
+            }
+            Ok(t) => t,
+        };
+
+        let tracker_announce = tracker.announce(
+            &info_hash,
+            self_id.as_bytes().try_into()?,
+            0,
+            total_length,
+            0,
+        );
+
+        let (peers, seeders) = match tracker_announce.await {
+            Err(e) => {
+                println!("Error announcing to tracker {}: {}", url, e);
+                continue;
+            }
+            Ok(resp) => resp,
+        };
+
+        if seeders >= 5 {
+            println!("picked tracker: {}", url);
+            return Ok(peers);
+        }
+        continue;
+    }
+    anyhow::bail!("did not found a quality tracker");
 }
 
 pub fn gen_peer_id() -> String {

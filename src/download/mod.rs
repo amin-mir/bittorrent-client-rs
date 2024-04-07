@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,19 +24,19 @@ mod bitfield;
 use bitfield::Bitfield;
 
 const BLOCK_SIZE: u32 = 1 << 14;
-const MAX_INFLIGHT: u8 = 25;
-const MAX_SEEDS: usize = 15;
+const MAX_INFLIGHT_PER_PEER: u8 = 5;
+const MAX_SEEDS: usize = 5;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
 pub struct File {
     pub id: String,
     pub torrent_info: Arc<Info>,
-    pub peers: tracker::Peers,
+    pub peers: Vec<SocketAddr>,
     bytes: Vec<u8>,
 }
 
 impl File {
-    pub fn new(id: String, torrent_info: Info, peers: tracker::Peers) -> Self {
+    pub fn new(id: String, torrent_info: Info, peers: Vec<SocketAddr>) -> Self {
         let torrent_info = Arc::new(torrent_info);
         let bytes = vec![0; torrent_info.total_length() as usize];
         Self {
@@ -50,42 +49,36 @@ impl File {
 
     async fn pick_seeds(
         &mut self,
-        inflight: Arc<AtomicU8>,
         own_bitfield: Arc<Mutex<Bitfield>>,
-        dl_msg_tx: kanal::AsyncSender<DownloaderMsg>,
+        downloaded_pieces_tx: kanal::AsyncSender<DownloaderMsg>,
     ) -> anyhow::Result<()> {
         let total_pieces = self.torrent_info.num_pieces() as usize;
         let id = self.id.as_bytes().try_into()?;
-        // At this point, there are no other references to torrent_info
-        // so it is safe to call unwrap.
-        let info_hash = Arc::get_mut(&mut self.torrent_info).unwrap().hash();
+        let info_hash = self.torrent_info.hash();
         let mut num_seeds = 0;
 
-        for peer in &self.peers[..] {
-            let addr = (peer.ip, peer.port).into();
-
-            let sleep = time::sleep(Duration::from_secs(1));
+        for addr in &self.peers[..] {
+            let sleep = time::sleep(Duration::from_secs(5));
             tokio::pin!(sleep);
 
             let handshake_res = tokio::select! {
                 _ = &mut sleep => {
-                    println!("Peer {} handshake timeout", addr);
+                    // println!("Peer {} handshake timeout", addr);
                     continue;
                 }
-                handshake_res = check_is_seed(addr, id, info_hash, total_pieces) => handshake_res,
+                // SocketAddr is Copy, that's why we can do *addr. it won't move out.
+                handshake_res = check_is_seed(*addr, id, info_hash, total_pieces) => handshake_res,
             };
 
             match handshake_res {
                 Ok(stream) => {
                     num_seeds += 1;
-                    let inflight = Arc::clone(&inflight);
                     let own_bitfield = Arc::clone(&own_bitfield);
                     let mut downloader = SeedDownloader::new(
-                        inflight,
                         Arc::clone(&self.torrent_info),
                         own_bitfield,
                         stream,
-                        dl_msg_tx.clone(),
+                        downloaded_pieces_tx.clone(),
                     );
                     tokio::spawn(async move {
                         downloader.download().await;
@@ -112,12 +105,11 @@ impl File {
             self.torrent_info.piece_length
         );
 
-        let inflight = Arc::new(AtomicU8::new(0));
         let own_bitfield = Bitfield::zero(self.torrent_info.num_pieces());
         let own_bitfield = Arc::new(Mutex::new(own_bitfield));
         let (downloaded_pieces_tx, downloaded_pieces_rx) = kanal::bounded_async::<DownloaderMsg>(5);
 
-        self.pick_seeds(inflight, Arc::clone(&own_bitfield), downloaded_pieces_tx)
+        self.pick_seeds(Arc::clone(&own_bitfield), downloaded_pieces_tx)
             .await?;
 
         // TODO: read from the downloaded_pieces_rx
@@ -211,7 +203,6 @@ struct BlockDownload {
 struct SeedDownloader {
     addr: SocketAddr,
     choked_us: bool,
-    inflight: Arc<AtomicU8>,
     torrent_info: Arc<Info>,
     own_bitfield: Arc<Mutex<Bitfield>>,
     stream: Framed<TcpStream, MessageCodec>,
@@ -236,7 +227,6 @@ enum DownloaderMsg {
 
 impl SeedDownloader {
     fn new(
-        inflight: Arc<AtomicU8>,
         torrent_info: Arc<Info>,
         own_bitfield: Arc<Mutex<Bitfield>>,
         stream: Framed<TcpStream, MessageCodec>,
@@ -245,7 +235,6 @@ impl SeedDownloader {
         Self {
             addr: stream.get_ref().peer_addr().unwrap(),
             choked_us: true,
-            inflight,
             torrent_info,
             own_bitfield,
             stream,
@@ -257,6 +246,7 @@ impl SeedDownloader {
 
     async fn download(&mut self) {
         println!("picked a seed: {}", self.addr);
+        let mut inflight: u8 = 0;
 
         loop {
             {
@@ -282,7 +272,6 @@ impl SeedDownloader {
 
             let msg = match msg_res {
                 None => {
-                    println!("Peer stream ended. Report to the receiver and exit.");
                     // Peer stream ended. Report to the receiver and exit.
                     if let Err(e) = self
                         .downloaded_pieces_tx
@@ -299,7 +288,7 @@ impl SeedDownloader {
             match msg {
                 Err(e) => println!("error reading message from seed {}: {}", self.addr, e),
                 Ok(msg) => {
-                    if let Err(e) = self.handle_msg(msg).await {
+                    if let Err(e) = self.handle_msg(&mut inflight, msg).await {
                         println!("Error happened while handling seed message: {e}");
                     }
                 }
@@ -310,7 +299,7 @@ impl SeedDownloader {
     }
 
     // Return true if there are no more pieces to download.
-    async fn handle_msg(&mut self, msg: Message) -> anyhow::Result<()> {
+    async fn handle_msg(&mut self, inflight: &mut u8, msg: Message) -> anyhow::Result<()> {
         match msg {
             Message::KeepAlive => {
                 println!("Received keep alive for seed {}", self.addr);
@@ -354,7 +343,7 @@ impl SeedDownloader {
                 self.choked_us = false;
                 println!("peer {} unchoked us", self.addr);
 
-                self.request_pieces().await?;
+                self.request_pieces(inflight).await?;
                 Ok(())
             }
             Message::Bitfield(_) => {
@@ -402,7 +391,7 @@ impl SeedDownloader {
                 };
                 piece_dl.remaining_blocks -= 1;
 
-                self.inflight.fetch_sub(1, Ordering::Relaxed);
+                *inflight -= 1;
 
                 // println!(
                 //     "Received block [{}-{})/{} for piece ({}), remaining blocks: {}",
@@ -437,7 +426,7 @@ impl SeedDownloader {
                         .await?;
                 }
 
-                self.request_pieces().await?;
+                self.request_pieces(inflight).await?;
                 Ok(())
             }
             Message::Cancel {
@@ -450,7 +439,7 @@ impl SeedDownloader {
         }
     }
 
-    async fn request_pieces(&mut self) -> anyhow::Result<()> {
+    async fn request_pieces(&mut self, inflight: &mut u8) -> anyhow::Result<()> {
         if self.choked_us {
             println!("Cannot request more pieces as we are choked.");
             return Ok(());
@@ -471,7 +460,7 @@ impl SeedDownloader {
             // Requests as many blocks as possible for the given piece.
             request_blocks(
                 self.addr,
-                &self.inflight,
+                inflight,
                 *piece_index,
                 piece_dl,
                 &mut self.stream,
@@ -482,8 +471,7 @@ impl SeedDownloader {
 
         // If there are no more blocks for the pending requests,
         // go for the next piece.
-        let inflight = self.inflight.load(Ordering::Relaxed);
-        if inflight < MAX_INFLIGHT {
+        if *inflight < MAX_INFLIGHT_PER_PEER {
             let piece_index = {
                 let mut own_bitfield = self.own_bitfield.lock().await;
                 let Some(piece_index) = own_bitfield.pick_piece() else {
@@ -515,7 +503,7 @@ impl SeedDownloader {
 
             request_blocks(
                 self.addr,
-                &self.inflight,
+                inflight,
                 piece_index,
                 &mut piece_dl,
                 &mut self.stream,
@@ -553,7 +541,7 @@ impl SeedDownloader {
 
 async fn request_blocks(
     addr: SocketAddr,
-    inflight: &Arc<AtomicU8>,
+    inflight: &mut u8,
     piece_index: u32,
     piece_dl: &mut PieceDownload,
     message_stream: &mut Framed<TcpStream, MessageCodec>,
@@ -588,8 +576,8 @@ async fn request_blocks(
         );
         piece_dl.requested += block_len;
 
-        let prev_inflight = inflight.fetch_add(1, Ordering::Relaxed);
-        if prev_inflight == MAX_INFLIGHT - 1 {
+        *inflight += 1;
+        if *inflight == MAX_INFLIGHT_PER_PEER {
             break;
         }
     }
